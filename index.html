@@ -332,6 +332,7 @@
     
    const AREA_PACIENTE_URL = "https://integradaneuropsicologia.github.io/area-do-paciente-v2/";
     const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    let currentAccessContext = null;
 
     const FREQ5   = ["Nunca","Raramente","Às vezes","Frequentemente","Sempre"];
     const SEVER4  = ["Não","Leve","Moderada","Grave", "Não se aplica"];
@@ -569,6 +570,11 @@ const INDICATORS_CONFIG = {};
       return "";
     }
 
+    function getTokenFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      return String(params.get("token") || params.get("t") || "").trim();
+    }
+
     function getTestCodeFromUrl() {
       const params = new URLSearchParams(window.location.search);
       return params.get("form") || params.get("code") || TEST_CODE_FIXO;
@@ -674,9 +680,13 @@ const INDICATORS_CONFIG = {};
       return true;
     }
 
-    function redirectToAreaPaciente() {
+    function redirectToAreaPaciente(cpf) {
       const token = getTokenFromUrl();
-      window.location.href = token ? `${AREA_PACIENTE_URL}?token=${encodeURIComponent(token)}` : AREA_PACIENTE_URL;
+      window.location.href = token
+        ? `${AREA_PACIENTE_URL}?token=${encodeURIComponent(token)}`
+        : cpf
+          ? `${AREA_PACIENTE_URL}?${cpf}`
+          : AREA_PACIENTE_URL;
     }
 
     function normalizeTestsFeitosForSave(current) {
@@ -752,7 +762,6 @@ function interpretByCutoffs(score, cutoffs) {
     /**************************************************************
      * VALIDAÇÃO PRINCIPAL
      **************************************************************/
-
     async function getPatientFormAccessByToken() {
       const token = getTokenFromUrl();
       const testCode = getTestCodeFromUrl();
@@ -824,10 +833,10 @@ function interpretByCutoffs(score, cutoffs) {
 
 
     async function validarAcessoAoTeste() {
-      const cpf = getCpfFromUrl();
       const token = getTokenFromUrl();
-      installPatientTokenAccessShim();
+      let cpf = getCpfFromUrl();
       const testCode = getTestCodeFromUrl();
+      installPatientTokenAccessShim();
 
       if (!token) {
         setStatus("Link invalido ou expirado. Abra o formulario pela area do paciente.", "err");
@@ -847,6 +856,45 @@ function interpretByCutoffs(score, cutoffs) {
       `;
 
       setStatus("Consultando liberação do teste...", "loading");
+
+      if (token) {
+        const { data, error } = await supabaseClient.rpc("get_public_patient_form_access", {
+          p_token: token,
+          p_form_code: testCode
+        });
+
+        if (error) {
+          console.error(error);
+          setStatus(error.message || "Erro ao consultar acesso do formulário.", "err");
+          return;
+        }
+
+        const access = Array.isArray(data) ? data[0] : data;
+
+        if (!access) {
+          setStatus("Link inválido ou expirado.", "err");
+          return;
+        }
+
+        currentAccessContext = access;
+        cpf = normalizeCPF(access.cpf);
+
+        $("metaInfo").classList.remove("hidden");
+        $("metaInfo").innerHTML = `
+          <span class="pill">CPF: ${cpf}</span>
+          <span class="pill">Teste: ${testCode}</span>
+        `;
+
+        if (access.already_done) {
+          setStatus("Teste já realizado. Redirecionando para a área do paciente...", "ok");
+          setTimeout(() => redirectToAreaPaciente(cpf), 700);
+          return;
+        }
+
+        setStatus("Teste liberado. Formulário disponível.", "ok");
+        $("formWrap").classList.remove("hidden");
+        return;
+      }
 
       const { data, error } = await supabaseClient
         .from("patients")
@@ -1470,8 +1518,10 @@ function scrollToRow(row){
   btn.textContent = "Enviando...";
 
   try {
-    const cpf = getCpfFromUrl();
     const token = getTokenFromUrl();
+    const cpf = currentAccessContext?.cpf
+      ? normalizeCPF(currentAccessContext.cpf)
+      : getCpfFromUrl();
     installPatientTokenAccessShim();
     const testCode = getTestCodeFromUrl();
     const submittedAt = new Date().toISOString();
@@ -1497,6 +1547,31 @@ const resultsMetaPayload = Object.fromEntries(
     return entries;
   })
 );
+
+    if (token) {
+      const { error: submitError } = await supabaseClient.rpc("submit_public_patient_form_response", {
+        p_token: token,
+        p_form_code: testCode,
+        p_form_name: document.title || testCode,
+        p_results: resultsPayload,
+        p_results_meta: resultsMetaPayload
+      });
+
+      if (submitError) {
+        console.error("ERRO RPC submit_public_patient_form_response:", submitError);
+        throw new Error(
+          `Erro ao salvar respostas: ${submitError.message || ""} ${submitError.details || ""} ${submitError.hint || ""}`.trim()
+        );
+      }
+
+      setStatus("Respostas enviadas com sucesso. Redirecionando...", "ok");
+
+      setTimeout(() => {
+        redirectToAreaPaciente(cpf);
+      }, 700);
+
+      return;
+    }
 
     // 1) Revalida no patients (não confiar só na validação inicial)
     const { data: patient, error: patientError } = await supabaseClient
